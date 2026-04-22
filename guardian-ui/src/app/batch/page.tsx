@@ -5,30 +5,9 @@ import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 import Link from "next/link";
 import { useI18n, LanguageToggle } from "@/lib/i18n";
+import { useBatchScan } from "@/lib/batch-scan-context";
 
 const API_BASE = process.env.NEXT_PUBLIC_GUARDIAN_API || "http://localhost:8899";
-
-interface SkillResult {
-  skill_name: string;
-  verdict: string;
-  false_negative: boolean;
-  latency: number;
-  findings: number;
-  progress: number;
-  error?: string;
-}
-
-interface BatchSummary {
-  batch_id: string;
-  total_skills: number;
-  scanned: number;
-  safe: number;
-  unsafe: number;
-  error: number;
-  false_negatives: number;
-  latency_total: number;
-  latency_avg: number;
-}
 
 const VERDICT_STYLES: Record<string, { bg: string; text: string; border: string }> = {
   PASSED: { bg: "bg-emerald-50", text: "text-emerald-600", border: "border-emerald-200" },
@@ -48,135 +27,72 @@ export default function BatchPage() {
   const router = useRouter();
   const [historyMap, setHistoryMap] = useState<Record<string, string>>({});
   const [skillsDir, setSkillsDir] = useState("");
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [discoveredSkills, setDiscoveredSkills] = useState<number>(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [concurrency, setConcurrency] = useState(6);
   const [scanMode, setScanMode] = useState<"static" | "sandbox" | "deep">("deep");
   const useLlm = true;
   const useRuntime = scanMode === "sandbox" || scanMode === "deep";
-  const useVerify = scanMode === "deep";
+  const enableAfterTool = scanMode === "deep";
 
-  const [scanning, setScanning] = useState(false);
-  const [results, setResults] = useState<SkillResult[]>([]);
-  const [summary, setSummary] = useState<BatchSummary | null>(null);
-  const [totalSkills, setTotalSkills] = useState(0);
-  const [scannedCount, setScannedCount] = useState(0);
-  const [errorMsg, setErrorMsg] = useState("");
-  const [logs, setLogs] = useState<string[]>([]);
+  // Batch scan state is now global (survives route changes) — see BatchScanProvider.
+  const {
+    scanning,
+    results,
+    summary,
+    totalSkills,
+    scannedCount,
+    errorMsg,
+    logs,
+    startScan: startBatchScan,
+    stopScan: stopBatchScan,
+  } = useBatchScan();
+
+  const [uploadError, setUploadError] = useState("");
   const logsEndRef = useRef<HTMLDivElement>(null);
-  const abortRef = useRef<AbortController | null>(null);
 
   // Filter state
   const [filterVerdict, setFilterVerdict] = useState<string>("all");
 
-  const startScan = useCallback(() => {
-    if (!skillsDir.trim()) return;
-    setScanning(true);
-    setResults([]);
-    setSummary(null);
-    setTotalSkills(0);
-    setScannedCount(0);
-    setErrorMsg("");
-    setLogs([]);
+  const handleStartClick = useCallback(async () => {
+    let dir = skillsDir.trim();
 
-    const batchId = `batch-${Date.now().toString(36)}`;
-    const params = new URLSearchParams({
-      skills_dir: skillsDir.trim(),
-      concurrency: String(concurrency),
-      use_llm: String(useLlm),
-      use_runtime: String(useRuntime),
-      use_verify: String(useVerify),
-    });
-
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    const url = `${API_BASE}/api/batch/${batchId}/stream?${params}`;
-
-    fetch(url, { signal: controller.signal })
-      .then(async (res) => {
-        if (!res.ok) {
-          setErrorMsg(`HTTP ${res.status}`);
-          setScanning(false);
+    // If file selected, upload first
+    if (selectedFile && !dir) {
+      setUploading(true);
+      setUploadError("");
+      try {
+        const formData = new FormData();
+        formData.append("file", selectedFile);
+        const uploadRes = await fetch(`${API_BASE}/api/batch/upload`, { method: "POST", body: formData });
+        if (!uploadRes.ok) {
+          setUploadError(`Upload failed: HTTP ${uploadRes.status}`);
+          setUploading(false);
           return;
         }
-        const reader = res.body?.getReader();
-        if (!reader) return;
-
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-
-          for (const line of lines) {
-            if (!line.startsWith("data: ")) continue;
-            try {
-              const evt = JSON.parse(line.slice(6));
-              handleSSE(evt);
-            } catch {
-              // ignore parse errors
-            }
-          }
-        }
-        setScanning(false);
-      })
-      .catch((err) => {
-        if (err.name !== "AbortError") {
-          setErrorMsg(err.message);
-        }
-        setScanning(false);
-      });
-  }, [skillsDir, concurrency, scanMode]);
-
-  const handleSSE = useCallback((evt: { stage: number; type: string; text: string; data?: Record<string, unknown> }) => {
-    setLogs((prev) => [...prev, evt.text]);
-
-    if (evt.type === "batch_start" && evt.data) {
-      setTotalSkills(evt.data.total as number);
-    } else if (evt.type === "skill_done" && evt.data) {
-      const d = evt.data as unknown as SkillResult;
-      setResults((prev) => {
-        const next = [...prev, d];
-        try { sessionStorage.setItem("batch_results", JSON.stringify(next)); } catch {}
-        return next;
-      });
-      setScannedCount(d.progress);
-    } else if (evt.type === "batch_done" && evt.data) {
-      const s = evt.data as unknown as BatchSummary;
-      setSummary(s);
-      try { sessionStorage.setItem("batch_summary", JSON.stringify(s)); } catch {}
-    } else if (evt.type === "error") {
-      setErrorMsg(evt.text);
+        const uploadData = await uploadRes.json();
+        dir = uploadData.skills_dir;
+        setSkillsDir(dir);
+        setDiscoveredSkills(uploadData.skill_count || 0);
+      } catch (err: unknown) {
+        setUploadError(`Upload failed: ${err instanceof Error ? err.message : String(err)}`);
+        setUploading(false);
+        return;
+      }
+      setUploading(false);
     }
-  }, []);
 
-  const stopScan = useCallback(() => {
-    abortRef.current?.abort();
-    setScanning(false);
-  }, []);
-
-  // Restore previous scan results from sessionStorage on mount
-  useEffect(() => {
-    try {
-      const savedResults = sessionStorage.getItem("batch_results");
-      const savedSummary = sessionStorage.getItem("batch_summary");
-      if (savedResults) {
-        const parsed = JSON.parse(savedResults) as SkillResult[];
-        if (parsed.length > 0) {
-          setResults(parsed);
-          setScannedCount(parsed.length);
-          setTotalSkills(parsed.length);
-        }
-      }
-      if (savedSummary) {
-        setSummary(JSON.parse(savedSummary) as BatchSummary);
-      }
-    } catch {}
-  }, []);
+    if (!dir) return;
+    startBatchScan({
+      skillsDir: dir,
+      concurrency,
+      useLlm,
+      useRuntime,
+      enableAfterTool,
+    });
+  }, [skillsDir, selectedFile, concurrency, useLlm, useRuntime, enableAfterTool, startBatchScan]);
 
   // Fetch history to map skill_name -> id for linking to detail pages
   useEffect(() => {
@@ -228,17 +144,13 @@ export default function BatchPage() {
     <div className="min-h-screen bg-warm flex flex-col">
       {/* Nav */}
       <nav className="shrink-0">
-        <div className="accent-line" />
-        <div className="nav-dark">
+
+        <div className="nav-light bg-white/90 backdrop-blur-sm border-b border-stone-200">
           <div className="max-w-7xl mx-auto px-8 h-14 flex items-center justify-between">
             <Link href="/" className="flex items-center gap-3">
-              <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-400 to-teal-500 flex items-center justify-center shadow-lg shadow-cyan-500/20">
-                <svg className="w-4.5 h-4.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" />
-                </svg>
-              </div>
+              <img src="/logo.jpg" alt="SkillWard" className="w-8 h-8 rounded-lg object-cover" />
               <div>
-                <span className="font-bold text-sm tracking-wider text-white uppercase">{t("nav.title")}</span>
+                <span className="font-bold text-sm tracking-wider text-stone-800 uppercase">{t("nav.title")}</span>
               </div>
             </Link>
 
@@ -246,7 +158,7 @@ export default function BatchPage() {
               <Link href="/" className="text-xs font-semibold px-4 py-1.5 rounded-lg text-stone-400 hover:text-white transition-all">
                 {t("nav.submit")}
               </Link>
-              <span className="text-xs font-semibold px-4 py-1.5 rounded-lg bg-cyan-600 text-white">
+              <span className="text-xs font-semibold px-4 py-1.5 rounded-lg bg-violet-600 text-white">
                 {t("nav.batch")}
               </span>
               <Link href="/history" className="text-xs font-semibold px-4 py-1.5 rounded-lg text-stone-400 hover:text-white transition-all">
@@ -264,36 +176,103 @@ export default function BatchPage() {
 
       {/* Content */}
       <div className="flex-1">
-        <div className="max-w-7xl mx-auto px-8 py-8">
+        <div className="max-w-6xl mx-auto px-8 py-10">
           {/* Title */}
-          <div className="mb-6">
-            <h1 className="text-2xl font-bold text-stone-800">{t("batch.title")}</h1>
+          <div className="text-center mb-8">
+            <h1 className="text-3xl font-bold text-stone-800 mb-2">{t("batch.title")}</h1>
+            <p className="text-sm text-stone-400">{t("batch.subtitle")}</p>
           </div>
 
-          {/* Input form */}
-          <div className="card-white rounded-xl border border-stone-200 p-6 mb-6">
-            <div className="grid grid-cols-1 lg:grid-cols-[1fr_auto] gap-4">
-              {/* Path input */}
-              <div>
-                <label className="block text-xs font-semibold text-stone-500 mb-1.5">{t("batch.dir_label")}</label>
-                <input
-                  type="text"
-                  value={skillsDir}
-                  onChange={(e) => setSkillsDir(e.target.value)}
-                  placeholder={t("batch.dir_placeholder")}
-                  className="w-full px-4 py-2.5 rounded-lg border border-stone-200 bg-stone-50 text-sm text-stone-800 font-mono placeholder:text-stone-300 focus:border-cyan-400 focus:ring-1 focus:ring-cyan-200 focus:outline-none transition-all"
-                  disabled={scanning}
-                />
+          {/* Upload + Controls */}
+          <div className="flex gap-6 mb-8">
+            {/* Left: Upload zone */}
+            <div className="flex-1 card-white rounded-xl border border-stone-200 p-6">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".zip,.tar.gz,.tgz"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) { setSelectedFile(file); setSkillsDir(""); setDiscoveredSkills(0); }
+                }}
+                disabled={scanning || uploading}
+              />
+              <div
+                onClick={() => fileInputRef.current?.click()}
+                className={cn(
+                  "drop-zone rounded-xl flex flex-col items-center justify-center py-16 px-6 cursor-pointer group border-2 border-dashed border-stone-200 hover:border-violet-400 bg-stone-50/50 hover:bg-violet-50/30 transition-all",
+                  (scanning || uploading) && "opacity-50 pointer-events-none"
+                )}
+              >
+                {selectedFile ? (
+                  <>
+                    <div className="w-14 h-14 rounded-xl bg-emerald-50 border border-emerald-200 flex items-center justify-center mb-4">
+                      <svg className="w-7 h-7 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                    </div>
+                    <p className="text-sm text-stone-700 font-semibold mb-1">{selectedFile.name}</p>
+                    <p className="text-xs text-stone-400 font-mono">{(selectedFile.size / 1024 / 1024).toFixed(1)} MB</p>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setSelectedFile(null); setSkillsDir(""); setDiscoveredSkills(0); if (fileInputRef.current) fileInputRef.current.value = ""; }}
+                      className="mt-3 text-xs text-stone-400 hover:text-red-500 transition-colors"
+                    >
+                      {t("upload.drop.remove")}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <div className="w-14 h-14 rounded-xl bg-violet-50 border border-violet-200 flex items-center justify-center mb-4 group-hover:scale-105 transition-transform">
+                      <svg className="w-7 h-7 text-violet-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M20.25 7.5l-.625 10.632a2.25 2.25 0 01-2.247 2.118H6.622a2.25 2.25 0 01-2.247-2.118L3.75 7.5m8.25 3v6.75m0 0l-3-3m3 3l3-3M3.375 7.5h17.25c.621 0 1.125-.504 1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125v1.5c0 .621.504 1.125 1.125 1.125z" />
+                      </svg>
+                    </div>
+                    <p className="text-sm text-stone-500 mb-2">{t("batch.dir_placeholder")}</p>
+                    <p className="text-xs text-stone-400 font-mono">
+                      <span className="text-stone-600">.zip</span> · <span className="text-stone-600">.tar.gz</span> · <span className="text-stone-600">.tgz</span>
+                    </p>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* Right: Controls */}
+            <div className="w-[280px] shrink-0 flex flex-col gap-4">
+              {/* Scan mode */}
+              <div className="card-white rounded-xl border border-stone-200 p-5 flex-1">
+                <div className="text-xs font-bold text-violet-700 uppercase tracking-wider mb-3">{t("mode.title")}</div>
+                <div className="space-y-2">
+                  {([
+                    { key: "static" as const, label: t("mode.static.name"), sub: "~10s" },
+                    { key: "sandbox" as const, label: t("mode.sandbox.name"), sub: "~2-3min" },
+                    { key: "deep" as const, label: t("mode.deep.name"), sub: "~2-4min" },
+                  ]).map((m) => (
+                    <button key={m.key}
+                      onClick={() => setScanMode(m.key)}
+                      disabled={scanning}
+                      className={cn(
+                        "w-full flex items-center justify-between px-4 py-3 rounded-lg border transition-all text-left",
+                        scanMode === m.key
+                          ? "border-violet-400 bg-violet-50 shadow-sm"
+                          : "border-stone-200 hover:border-stone-300"
+                      )}
+                    >
+                      <span className={cn("text-sm font-bold", scanMode === m.key ? "text-violet-700" : "text-stone-600")}>{m.label}</span>
+                      <span className={cn("text-[10px] font-mono", scanMode === m.key ? "text-violet-500" : "text-stone-400")}>{m.sub}</span>
+                    </button>
+                  ))}
+                </div>
               </div>
 
-              {/* Controls row */}
-              <div className="flex items-end gap-3">
-                <div>
-                  <label className="block text-xs font-semibold text-stone-500 mb-1.5">{t("batch.concurrency")}</label>
+              {/* Concurrency + Start */}
+              <div className="card-white rounded-xl border border-stone-200 p-5">
+                <div className="flex items-center justify-between mb-4">
+                  <label className="text-xs font-bold text-stone-500">{t("batch.concurrency")}</label>
                   <select
                     value={concurrency}
                     onChange={(e) => setConcurrency(Number(e.target.value))}
-                    className="px-3 py-2.5 rounded-lg border border-stone-200 bg-stone-50 text-sm font-mono"
+                    className="px-3 py-1.5 rounded-lg border border-stone-200 bg-stone-50 text-sm font-mono"
                     disabled={scanning}
                   >
                     {[1, 2, 4, 6, 8, 12].map((n) => (
@@ -301,38 +280,18 @@ export default function BatchPage() {
                     ))}
                   </select>
                 </div>
-
-                <div className="flex items-center gap-1 bg-stone-100 rounded-lg p-0.5">
-                  {([
-                    { key: "static" as const, label: t("mode.static.name") },
-                    { key: "sandbox" as const, label: t("mode.sandbox.name") },
-                    { key: "deep" as const, label: t("mode.deep.name") },
-                  ]).map((m) => (
-                    <button key={m.key}
-                      onClick={() => setScanMode(m.key)}
-                      disabled={scanning}
-                      className={cn(
-                        "px-3 py-1.5 rounded-md text-xs font-bold transition-all",
-                        scanMode === m.key
-                          ? "bg-white text-cyan-600 shadow-sm"
-                          : "text-stone-400 hover:text-stone-600"
-                      )}
-                    >{m.label}</button>
-                  ))}
-                </div>
-
                 {!scanning ? (
                   <button
-                    onClick={startScan}
-                    disabled={!skillsDir.trim()}
-                    className="px-6 py-2.5 rounded-lg bg-cyan-600 text-white text-sm font-bold hover:bg-cyan-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                    onClick={handleStartClick}
+                    disabled={(!selectedFile && !skillsDir.trim()) || uploading}
+                    className="w-full py-3 rounded-lg bg-gradient-to-r from-violet-600 to-purple-600 text-white text-sm font-bold hover:from-violet-700 hover:to-purple-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-lg shadow-violet-600/20"
                   >
-                    {t("batch.start")}
+                    {uploading ? t("upload.scanning") : t("batch.start")}
                   </button>
                 ) : (
                   <button
-                    onClick={stopScan}
-                    className="px-6 py-2.5 rounded-lg bg-red-600 text-white text-sm font-bold hover:bg-red-700 transition-all"
+                    onClick={stopBatchScan}
+                    className="w-full py-3 rounded-lg bg-red-600 text-white text-sm font-bold hover:bg-red-700 transition-all"
                   >
                     {t("batch.stop")}
                   </button>
@@ -356,7 +315,7 @@ export default function BatchPage() {
                 <div
                   className={cn(
                     "h-full rounded-full transition-all duration-300",
-                    scanning ? "bg-cyan-500" : "bg-emerald-500"
+                    scanning ? "bg-violet-500" : "bg-emerald-500"
                   )}
                   style={{ width: `${progressPct}%` }}
                 />
@@ -370,16 +329,16 @@ export default function BatchPage() {
                   <SummaryCard label={t("batch.stat.unsafe")} value={summary.unsafe} color="text-red-600" />
                   <SummaryCard label={t("batch.stat.error")} value={summary.error} color="text-stone-500" />
                   <SummaryCard label={t("batch.stat.fn")} value={summary.false_negatives} color="text-amber-600" />
-                  <SummaryCard label={t("batch.stat.avg_latency")} value={`${summary.latency_avg}s`} color="text-cyan-600" />
+                  <SummaryCard label={t("batch.stat.avg_latency")} value={`${summary.latency_avg}s`} color="text-violet-600" />
                 </div>
               )}
             </div>
           )}
 
           {/* Error message */}
-          {errorMsg && (
+          {(errorMsg || uploadError) && (
             <div className="mb-6 p-4 rounded-xl bg-red-50 border border-red-200 text-red-600 text-sm">
-              {errorMsg}
+              {uploadError || errorMsg}
             </div>
           )}
 
@@ -399,7 +358,7 @@ export default function BatchPage() {
                       className={cn(
                         "text-[11px] font-semibold px-3 py-1 rounded-md transition-all",
                         filterVerdict === f
-                          ? "bg-cyan-600 text-white"
+                          ? "bg-violet-600 text-white"
                           : "text-stone-400 hover:text-stone-600 hover:bg-stone-100"
                       )}
                     >
@@ -437,7 +396,7 @@ export default function BatchPage() {
                             </span>
                           </td>
                           <td className="px-6 py-2.5 font-mono text-stone-500">{r.findings}</td>
-                          <td className="px-6 py-2.5 font-mono text-cyan-600">{r.latency}s</td>
+                          <td className="px-6 py-2.5 font-mono text-violet-600">{r.latency}s</td>
                           <td className="px-6 py-2.5">
                             {r.false_negative && (
                               <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-amber-50 text-amber-600">FN</span>
