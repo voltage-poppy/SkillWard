@@ -1,4 +1,4 @@
-<p align="center">
+·<p align="center">
   <img src="./resources/banner.png" alt="SkillWard Banner" width="100%" />
 </p>
 
@@ -244,6 +244,16 @@ SkillWard/
 | [CLI Guide](docs/cli.md) | Full command-line reference, common usage, and output files |
 | [Showcase](docs/showcase.md) | Real-world detection cases, how SkillWard catches threats in public Skills |
 | [Comparison](docs/comparison.md) | Side-by-side analysis with two open-source scanning tools |
+
+---
+
+## 📋 Changelog
+
+| Date | Summary | Details |
+|------|---------|---------|
+| 2026-04-22 | 🛑 **UI refresh** — batch-scan progress is persisted automatically; added a scan-result reuse mechanism | [docs/UPDATE_REPORT_2026-04-21.md](docs/UPDATE_REPORT_2026-04-21.md) |
+| 2026-04-14 | 🧠 **Stage B prompt redesign** — Stage B LLM triage prompt upgraded to a structured System + User two-part prompt | [docs/UPDATE_REPORT_2026-04-14.md](docs/UPDATE_REPORT_2026-04-14.md) |
+| 2026-04-10 | 🔒 **Sandbox gateway stability fix** — fixed the OpenClaw Gateway daemon not starting, resolving the exec-approval failure | [docs/UPDATE_REPORT_2026-04-10.md](docs/UPDATE_REPORT_2026-04-10.md) |
 
 ---
 
